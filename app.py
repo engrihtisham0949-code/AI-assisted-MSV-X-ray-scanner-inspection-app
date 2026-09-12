@@ -33,7 +33,7 @@ DENSITY_Z_THRESHOLD = 2.2
 PATTERN_Z_THRESHOLD = 2.4
 MIN_COMPONENT_AREA_RATIO = 0.0008
 
-VISION_MODEL = "qwen/qwen3.6-27b"
+VISION_MODEL = "openai/gpt-oss-120b"
 
 
 # -----------------------------
