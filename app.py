@@ -1,511 +1,156 @@
-import base64
-import io
-import json
-import os
-
+import base64, io, os
 import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
 from groq import Groq
 
+st.set_page_config(page_title="MSV AI Scanner Inspector", page_icon="🔎", layout="wide")
+st.title("🔎 MSV Scanner AI Inspector")
+st.caption("EMPTY • NORMAL • ABNORMAL | Density + Continuous Pattern Analysis")
 
-st.set_page_config(
-    page_title="MSV Scanner Image Anomaly Detector",
-    page_icon="🔎",
-    layout="wide",
-)
-
-st.title("🔎 MSV Scanner — Normal / Abnormal / EMPTY")
-st.caption(
-    "Hybrid inspection prototype: computer-vision density/pattern analysis + Groq vision review."
-)
-
-
-# -----------------------------
-# Configuration
-# -----------------------------
-GRID_ROWS = 12
-GRID_COLS = 12
-
-# Higher values make the detector less sensitive.
-DENSITY_Z_THRESHOLD = 2.2
-PATTERN_Z_THRESHOLD = 2.4
-MIN_COMPONENT_AREA_RATIO = 0.0008
-
+ROWS, COLS = 12, 12
 VISION_MODEL = "openai/gpt-oss-120b"
 
+def groq_client():
+    try: key = st.secrets.get("GROQ_API_KEY")
+    except Exception: key = None
+    key = key or os.getenv("GROQ_API_KEY")
+    return Groq(api_key=key) if key else None
 
-# -----------------------------
-# Helper functions
-# -----------------------------
-def get_groq_client():
-    """Read the Groq key from Streamlit secrets or an environment variable."""
-    api_key = None
-
-    try:
-        api_key = st.secrets.get("GROQ_API_KEY")
-    except Exception:
-        pass
-
-    api_key = api_key or os.getenv("GROQ_API_KEY")
-
-    if not api_key:
-        return None
-
-    return Groq(api_key=api_key)
-
-
-def image_to_bgr(pil_image):
-    """Convert uploaded PIL image to OpenCV BGR."""
-    rgb = np.array(pil_image.convert("RGB"))
-    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-
-def normalize_gray(gray):
-    """Improve contrast while keeping the original structure."""
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return clahe.apply(gray)
-
-
-def foreground_mask(gray):
-    """
-    Estimate whether meaningful scanner content exists.
-    This is intentionally conservative and should be calibrated with real MSV images.
-    """
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # Otsu gives a first separation of object/background.
-    _, mask1 = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Scanner images can have either bright or dark objects, so also test
-    # deviation from the global background.
-    bg = cv2.GaussianBlur(gray, (0, 0), 25)
-    deviation = cv2.absdiff(gray, bg)
-    _, mask2 = cv2.threshold(deviation, 12, 255, cv2.THRESH_BINARY)
-
-    mask = cv2.bitwise_or(mask1, mask2)
-
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    return mask
-
-
-def is_empty(gray):
-    """Return empty decision and foreground ratio."""
-    mask = foreground_mask(gray)
-    ratio = float(np.count_nonzero(mask)) / mask.size
-
-    # A very small amount of foreground is considered empty.
-    return ratio < 0.015, ratio, mask
-
-
-def tile_features(gray, rows=GRID_ROWS, cols=GRID_COLS):
-    """
-    Calculate robust density and local-pattern features for each tile.
-
-    Density:
-      median grayscale value and robust spread.
-
-    Pattern:
-      average horizontal and vertical gradient strength.
-    """
-    h, w = gray.shape
-    density = np.zeros((rows, cols), dtype=np.float32)
-    pattern = np.zeros((rows, cols), dtype=np.float32)
-
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    grad = cv2.magnitude(gx, gy)
-
-    for r in range(rows):
-        y1 = int(r * h / rows)
-        y2 = int((r + 1) * h / rows)
-
-        for c in range(cols):
-            x1 = int(c * w / cols)
-            x2 = int((c + 1) * w / cols)
-
-            tile = gray[y1:y2, x1:x2]
-            tile_grad = grad[y1:y2, x1:x2]
-
-            density[r, c] = np.median(tile)
-            pattern[r, c] = np.mean(tile_grad)
-
-    return density, pattern
-
-
-def robust_z_score(matrix):
-    """Median/MAD z-score; much less affected by one abnormal tile."""
-    med = np.median(matrix)
-    mad = np.median(np.abs(matrix - med))
-
+def zscore(a):
+    med = np.median(a); mad = np.median(np.abs(a-med))
     if mad < 1e-6:
-        std = np.std(matrix)
-        if std < 1e-6:
-            return np.zeros_like(matrix)
-        return (matrix - med) / (std + 1e-6)
+        sd = np.std(a)
+        return np.zeros_like(a) if sd < 1e-6 else (a-med)/(sd+1e-6)
+    return .6745*(a-med)/(mad+1e-6)
 
-    return 0.6745 * (matrix - med) / (mad + 1e-6)
+def neighbors(a):
+    out = np.zeros_like(a, dtype=np.float32)
+    for r in range(a.shape[0]):
+        for c in range(a.shape[1]):
+            n=[]
+            if r: n.append(a[r-1,c])
+            if r<a.shape[0]-1: n.append(a[r+1,c])
+            if c: n.append(a[r,c-1])
+            if c<a.shape[1]-1: n.append(a[r,c+1])
+            out[r,c]=abs(a[r,c]-np.mean(n))
+    return out
 
+def roi_from_image(gray):
+    h,w=gray.shape
+    box=(int(.03*w),int(.30*h),int(.97*w),int(.76*h))
+    x1,y1,x2,y2=box
+    return gray[y1:y2,x1:x2],box
 
-def pattern_break_map(gray, rows=GRID_ROWS, cols=GRID_COLS):
-    """
-    Detect local continuity breaks.
+def empty_test(roi, threshold):
+    g=cv2.GaussianBlur(roi,(5,5),0)
+    gx=cv2.Sobel(g,cv2.CV_32F,1,0,ksize=3)
+    gy=cv2.Sobel(g,cv2.CV_32F,0,1,ksize=3)
+    mag=cv2.magnitude(gx,gy)
+    my=max(1,int(.08*roi.shape[0])); mx=max(1,int(.03*roi.shape[1]))
+    inner=mag[my:-my,mx:-mx]
+    score=float(np.mean(inner if inner.size else mag))
+    return score<threshold,score
 
-    A tile is suspicious when its gradient energy is substantially different
-    from neighboring tiles in the same row/column.
-    """
-    _, pattern = tile_features(gray, rows, cols)
+def analyze(roi, dthr, pthr, cthr):
+    h,w=roi.shape
+    den=np.zeros((ROWS,COLS),np.float32)
+    pat=np.zeros_like(den); tex=np.zeros_like(den)
+    gx=cv2.Sobel(roi,cv2.CV_32F,1,0,ksize=3)
+    gy=cv2.Sobel(roi,cv2.CV_32F,0,1,ksize=3)
+    grad=cv2.magnitude(gx,gy)
+    for r in range(ROWS):
+        for c in range(COLS):
+            y1,y2=int(r*h/ROWS),int((r+1)*h/ROWS)
+            x1,x2=int(c*w/COLS),int((c+1)*w/COLS)
+            t=roi[y1:y2,x1:x2]; g=grad[y1:y2,x1:x2]
+            den[r,c]=np.median(t); pat[r,c]=np.mean(g); tex[r,c]=np.std(t)
 
-    neighbor_difference = np.zeros_like(pattern)
+    # STRICT RULE: any meaningful density difference OR pattern/continuity
+    # break makes the image ABNORMAL.
+    da=np.abs(zscore(den))>=dthr
+    pa=(np.abs(zscore(neighbors(pat)))>=pthr) | (np.abs(zscore(neighbors(tex)))>=pthr)
+    ca=np.abs(zscore(neighbors(den)))>=cthr
+    abnormal=da|pa|ca
+    return abnormal,int(da.sum()),int(pa.sum()),int(ca.sum())
 
-    for r in range(rows):
-        for c in range(cols):
-            neighbors = []
+def make_result(bgr, abnormal, box):
+    x1,y1,x2,y2=box
+    tile=(abnormal.astype(np.uint8)*255)
+    roi_mask=cv2.resize(tile,(x2-x1,y2-y1),interpolation=cv2.INTER_NEAREST)
+    roi_mask=cv2.morphologyEx(roi_mask,cv2.MORPH_CLOSE,np.ones((5,5),np.uint8))
+    full=np.zeros(bgr.shape[:2],np.uint8); full[y1:y2,x1:x2]=roi_mask
+    out=bgr.copy(); red=out.copy(); red[full>0]=(0,0,255)
+    out=cv2.addWeighted(out,.65,red,.35,0)
+    boxes=[]
+    contours,_=cv2.findContours(full,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        x,y,w,h=cv2.boundingRect(cnt)
+        if w*h>500:
+            cv2.rectangle(out,(x,y),(x+w,y+h),(0,0,255),3)
+            cv2.putText(out,"ABNORMAL",(x,max(25,y-8)),cv2.FONT_HERSHEY_SIMPLEX,.7,(0,0,255),2)
+            boxes.append({"x":int(x),"y":int(y),"width":int(w),"height":int(h)})
+    return out,boxes
 
-            if r > 0:
-                neighbors.append(pattern[r - 1, c])
-            if r < rows - 1:
-                neighbors.append(pattern[r + 1, c])
-            if c > 0:
-                neighbors.append(pattern[r, c - 1])
-            if c < cols - 1:
-                neighbors.append(pattern[r, c + 1])
-
-            neighbor_difference[r, c] = abs(
-                pattern[r, c] - float(np.mean(neighbors))
-            )
-
-    return neighbor_difference
-
-
-def build_anomaly_map(gray):
-    """
-    Combine density anomalies and pattern-continuity anomalies.
-    """
-    density, pattern = tile_features(gray)
-    density_z = np.abs(robust_z_score(density))
-    pattern_z = np.abs(robust_z_score(pattern))
-
-    continuity = pattern_break_map(gray)
-    continuity_z = np.abs(robust_z_score(continuity))
-
-    density_anomaly = density_z >= DENSITY_Z_THRESHOLD
-    pattern_anomaly = (
-        (pattern_z >= PATTERN_Z_THRESHOLD)
-        | (continuity_z >= PATTERN_Z_THRESHOLD)
-    )
-
-    combined = density_anomaly | pattern_anomaly
-
-    # Ignore isolated tiny detections.
-    tile_mask = (combined.astype(np.uint8) * 255)
-    kernel = np.ones((3, 3), np.uint8)
-    tile_mask = cv2.morphologyEx(tile_mask, cv2.MORPH_CLOSE, kernel)
-
-    return {
-        "density": density,
-        "pattern": pattern,
-        "density_z": density_z,
-        "pattern_z": pattern_z,
-        "continuity_z": continuity_z,
-        "density_anomaly": density_anomaly,
-        "pattern_anomaly": pattern_anomaly,
-        "combined": tile_mask > 0,
-    }
-
-
-def tile_map_to_pixel_mask(tile_map, image_shape):
-    """Expand the tile-level anomaly map to image pixels."""
-    rows, cols = tile_map.shape
-    h, w = image_shape[:2]
-
-    small = (tile_map.astype(np.uint8) * 255)
-    full = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
-
-    # Smooth boundaries while retaining the detected region.
-    kernel = np.ones((11, 11), np.uint8)
-    full = cv2.morphologyEx(full, cv2.MORPH_CLOSE, kernel)
-
-    return full
-
-
-def remove_tiny_components(mask):
-    """Remove extremely small connected components."""
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask.astype(np.uint8), 8
-    )
-
-    cleaned = np.zeros_like(mask, dtype=np.uint8)
-    image_area = mask.shape[0] * mask.shape[1]
-    min_area = max(25, int(image_area * MIN_COMPONENT_AREA_RATIO))
-
-    for label in range(1, num_labels):
-        area = stats[label, cv2.CC_STAT_AREA]
-        if area >= min_area:
-            cleaned[labels == label] = 255
-
-    return cleaned
-
-
-def make_overlay(bgr, anomaly_mask):
-    """Draw detected abnormal areas in red and add bounding boxes."""
-    overlay = bgr.copy()
-    red = np.zeros_like(bgr)
-    red[:, :, 2] = 255
-
-    alpha = 0.42
-    mask_bool = anomaly_mask > 0
-
-    overlay[mask_bool] = cv2.addWeighted(
-        bgr[mask_bool], 1 - alpha, red[mask_bool], alpha, 0
-    )
-
-    contours, _ = cv2.findContours(
-        anomaly_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    boxes = []
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        if w * h >= 25:
-            cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 0, 255), 3)
-            boxes.append({"x": x, "y": y, "width": w, "height": h})
-
-    return cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), boxes
-
-
-def ask_groq_about_image(pil_image, local_result):
-    """
-    Groq is used as a second opinion / explanation layer.
-    The quantitative anomaly detector remains local and deterministic.
-    """
-    client = get_groq_client()
-    if client is None:
-        return {
-            "available": False,
-            "text": "Groq key not configured. Local computer-vision result is shown."
-        }
-
-    buffer = io.BytesIO()
-    pil_image.save(buffer, format="JPEG", quality=88)
-    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-    prompt = f"""
-You are assisting with an MSV/X-ray scanner image inspection prototype.
-
-The local computer-vision system calculated:
-- Local status: {local_result["status"]}
-- Foreground ratio: {local_result["foreground_ratio"]:.4f}
-- Density-anomaly tiles: {local_result["density_tiles"]}
-- Pattern-anomaly tiles: {local_result["pattern_tiles"]}
-- Total anomaly tiles: {local_result["total_anomaly_tiles"]}
-
-Review the uploaded scanner image visually.
-
-Important:
-1. Do NOT claim that visual inspection alone proves a real security threat.
-2. Give a concise second-opinion assessment.
-3. Look for major changes in apparent density/attenuation and broken/repeated-pattern regions.
-4. If there is no visible cargo/item, say EMPTY.
-5. If suspicious regions are visible, describe their approximate location such as upper-left, center, lower-right.
-6. State that the result is a prototype and should be calibrated/validated using labelled MSV scanner images.
-
-Return:
-Status: NORMAL / ABNORMAL / EMPTY / UNCERTAIN
-Reason: ...
-Approximate suspicious regions: ...
-"""
-
+def groq_review(image, local_status):
+    client=groq_client()
+    if not client: return "Groq API key not configured. Local inspection result is shown."
+    buf=io.BytesIO(); image.save(buf,format="JPEG",quality=90)
+    data=base64.b64encode(buf.getvalue()).decode()
+    prompt=f"""Review this MSV/X-ray scanner image. Local result: {local_status}.
+Rules: EMPTY if no meaningful cargo/item is inside the container. NORMAL only if cargo follows a continuous, consistent or repeated pattern. ABNORMAL if any meaningful portion has different density, or the continuous/repeated pattern is broken, discontinuous or inconsistent. STRICT: cargo that does not follow the expected consistent pattern is ABNORMAL. Give Status, Reason, and Suspicious area. This is a prototype; do not claim a proven security threat."""
     try:
-        response = client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{encoded}"
-                            },
-                        },
-                    ],
-                }
-            ],
-            temperature=0.1,
-            max_completion_tokens=500,
-        )
+        r=client.chat.completions.create(model=VISION_MODEL,messages=[{"role":"user","content":[{"type":"text","text":prompt},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+data}}]}],temperature=.1,max_completion_tokens=350)
+        return r.choices[0].message.content
+    except Exception as e: return f"Groq second opinion unavailable: {e}"
 
-        return {
-            "available": True,
-            "text": response.choices[0].message.content
-        }
-
-    except Exception as exc:
-        return {
-            "available": False,
-            "text": f"Groq vision review failed: {exc}"
-        }
-
-
-# -----------------------------
-# UI
-# -----------------------------
 with st.sidebar:
-    st.header("Detection settings")
-    st.write("These are prototype thresholds. Calibrate them with real labelled scanner images.")
+    st.header("Detection Settings")
+    empty_thr=st.slider("EMPTY sensitivity",1.0,40.0,8.0,.5)
+    density_thr=st.slider("Density anomaly threshold",1.0,6.0,2.8,.1)
+    pattern_thr=st.slider("Pattern break threshold",1.0,6.0,2.8,.1)
+    continuity_thr=st.slider("Continuity break threshold",1.0,6.0,2.8,.1)
+    st.info("STRICT RULE: No cargo = EMPTY. Continuous/consistent cargo = NORMAL. Different density OR broken/inconsistent pattern = ABNORMAL.")
 
-    density_threshold = st.slider(
-        "Density sensitivity",
-        min_value=1.0,
-        max_value=5.0,
-        value=float(DENSITY_Z_THRESHOLD),
-        step=0.1,
-    )
-
-    pattern_threshold = st.slider(
-        "Pattern sensitivity",
-        min_value=1.0,
-        max_value=5.0,
-        value=float(PATTERN_Z_THRESHOLD),
-        step=0.1,
-    )
-
-    st.info(
-        "For a production MSV system, use a labelled dataset of NORMAL, ABNORMAL "
-        "and EMPTY images and train/validate a dedicated model."
-    )
-
-uploaded = st.file_uploader(
-    "Upload an MSV scanner image",
-    type=["jpg", "jpeg", "png", "bmp", "webp"],
-)
-
-if uploaded is None:
-    st.markdown(
-        """
-### How this prototype works
-
-1. Upload a scanner image.
-2. The app checks whether meaningful content is present.
-3. It divides the image into a grid.
-4. It measures local grayscale/density and gradient/pattern features.
-5. It detects unusual density and continuity changes.
-6. It marks suspicious regions in red.
-7. Groq's vision model provides a second visual opinion.
-        """
-    )
+file=st.file_uploader("Upload MSV Scanner Image",type=["jpg","jpeg","png","bmp","webp"])
+if not file:
+    st.markdown("### Classification Logic\n- **EMPTY:** no meaningful item inside the container.\n- **NORMAL:** cargo has a continuous and consistent pattern.\n- **ABNORMAL:** different density or broken/inconsistent pattern. Abnormal regions are marked in red.")
     st.stop()
 
-try:
-    image = Image.open(uploaded).convert("RGB")
-except Exception as exc:
-    st.error(f"Could not read image: {exc}")
-    st.stop()
+image=Image.open(file).convert("RGB")
+bgr=cv2.cvtColor(np.array(image),cv2.COLOR_RGB2BGR)
+gray=cv2.cvtColor(bgr,cv2.COLOR_BGR2GRAY)
+gray=cv2.createCLAHE(clipLimit=2,tileGridSize=(8,8)).apply(gray)
+roi,box=roi_from_image(gray)
+empty,score=empty_test(roi,empty_thr)
 
-bgr = image_to_bgr(image)
-gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-gray = normalize_gray(gray)
-
-empty, foreground_ratio, _ = is_empty(gray)
-
+dc=pc=cc=0; boxes=[]
 if empty:
-    local_status = "EMPTY"
-    anomaly_mask = np.zeros_like(gray, dtype=np.uint8)
-    boxes = []
-    density_tiles = 0
-    pattern_tiles = 0
-    total_tiles = 0
+    status="EMPTY"; result=bgr.copy()
 else:
-    # Use the sidebar thresholds for this run.
-    density, pattern = tile_features(gray)
-    density_z = np.abs(robust_z_score(density))
-    pattern_z = np.abs(robust_z_score(pattern))
-    continuity = pattern_break_map(gray)
-    continuity_z = np.abs(robust_z_score(continuity))
+    abnormal,dc,pc,cc=analyze(roi,density_thr,pattern_thr,continuity_thr)
+    status="ABNORMAL" if abnormal.any() else "NORMAL"
+    result,boxes=make_result(bgr,abnormal,box)
 
-    density_anomaly = density_z >= density_threshold
-    pattern_anomaly = (
-        (pattern_z >= pattern_threshold)
-        | (continuity_z >= pattern_threshold)
-    )
+a,b=st.columns(2)
+with a:
+    st.subheader("Original MSV Image"); st.image(image,use_container_width=True)
+with b:
+    st.subheader("Inspection Result"); st.image(cv2.cvtColor(result,cv2.COLOR_BGR2RGB),use_container_width=True)
 
-    combined = density_anomaly | pattern_anomaly
+if status=="EMPTY": st.success("🟢 EMPTY — No meaningful cargo/item detected inside the container.")
+elif status=="NORMAL": st.success("🟢 NORMAL — Cargo follows a continuous and consistent pattern.")
+else: st.error("🔴 ABNORMAL — Density difference or broken/inconsistent pattern detected. Red areas are suspicious.")
 
-    # Clean tile map and expand it to pixels.
-    tile_mask = (combined.astype(np.uint8) * 255)
-    tile_mask = cv2.morphologyEx(
-        tile_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
-    )
+m1,m2,m3,m4=st.columns(4)
+m1.metric("Final Status",status); m2.metric("Content Score",f"{score:.2f}")
+m3.metric("Density Anomalies",dc); m4.metric("Pattern/Continuity",pc+cc)
+if status=="ABNORMAL" and boxes:
+    st.subheader("Marked Abnormal Regions"); st.json(boxes)
 
-    anomaly_mask = tile_map_to_pixel_mask(
-        tile_mask > 0, bgr.shape
-    )
-    anomaly_mask = remove_tiny_components(anomaly_mask)
+st.subheader("Groq AI Second Opinion")
+with st.spinner("Groq is reviewing the image..."):
+    st.write(groq_review(image,status))
 
-    density_tiles = int(np.count_nonzero(density_anomaly))
-    pattern_tiles = int(np.count_nonzero(pattern_anomaly))
-    total_tiles = int(np.count_nonzero(combined))
-
-    local_status = "ABNORMAL" if total_tiles > 0 else "NORMAL"
-
-overlay_rgb, boxes = make_overlay(bgr, anomaly_mask)
-
-local_result = {
-    "status": local_status,
-    "foreground_ratio": foreground_ratio,
-    "density_tiles": density_tiles,
-    "pattern_tiles": pattern_tiles,
-    "total_anomaly_tiles": total_tiles,
-}
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("Original image")
-    st.image(image, use_container_width=True)
-
-with col2:
-    st.subheader("AI/CV inspection result")
-    st.image(overlay_rgb, use_container_width=True)
-
-if local_status == "EMPTY":
-    st.success("🟢 EMPTY — no significant item/structure was detected.")
-elif local_status == "ABNORMAL":
-    st.error(f"🔴 ABNORMAL — {len(boxes)} suspicious region(s) marked in red.")
-else:
-    st.success("🟢 NORMAL — no significant density/pattern anomaly was detected.")
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Local status", local_status)
-m2.metric("Foreground ratio", f"{foreground_ratio:.3f}")
-m3.metric("Density anomaly tiles", density_tiles)
-m4.metric("Pattern anomaly tiles", pattern_tiles)
-
-if boxes:
-    st.subheader("Marked abnormal regions")
-    st.json(boxes)
-
-with st.spinner("Getting Groq vision second opinion..."):
-    groq_result = ask_groq_about_image(image, local_result)
-
-st.subheader("Groq vision second opinion")
-st.write(groq_result["text"])
-
-with st.expander("Technical details"):
-    st.write(
-        "This prototype uses robust tile-level statistics. "
-        "It is not a trained X-ray security classifier."
-    )
-    st.json(local_result)
-
-st.warning(
-    "IMPORTANT: Do not use this prototype as the sole safety/security decision "
-    "for live cargo screening. Real MSV/X-ray inspection requires labelled data, "
-    "calibration, validation, false-negative testing, and qualified human review."
-)
+st.warning("Prototype only. For operational use, calibrate the container ROI and thresholds using real labelled EMPTY, NORMAL and ABNORMAL MSV scanner images.")
